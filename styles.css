@@ -110,7 +110,6 @@ main { max-width: 600px; margin: 0 auto; padding: 0 16px 24px; }
 .bar { position: relative; height: 10px; border-radius: 5px; background: var(--bg); }
 .bar span { display: block; height: 100%; border-radius: 5px; background: var(--amber); transition: width 0.25s; }
 .met .bar span { background: var(--green); }
-.bar i { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; background: var(--muted); opacity: 0.45; }
 .progress-text { margin-top: 10px; font-size: 15px; color: var(--muted); }
 .progress-text strong { color: var(--text); }
 
@@ -129,6 +128,16 @@ main { max-width: 600px; margin: 0 auto; padding: 0 16px 24px; }
   transform: translateY(-2px) rotate(45deg);
 }
 .check-row input:checked + .row-name { color: var(--muted); }
+
+/* Workout groups */
+.group { padding: 14px 0 4px 16px; }
+.group-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding-right: 16px; margin-bottom: 8px; }
+.group-head strong { font-size: 17px; }
+.group .count { font-size: 14px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.group.met .count { color: var(--green); font-weight: 600; }
+.group .bar { height: 6px; margin: 0 16px 4px 0; }
+.group-edit-head { padding-top: 0; min-height: 44px; }
+.add-form.inset { padding: 8px 16px 10px 0; }
 
 /* Gym */
 .gym-row .num { display: flex; flex-direction: column; align-items: center; gap: 2px; }

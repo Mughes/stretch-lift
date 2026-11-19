@@ -1,6 +1,6 @@
 # Stretch + Lift
 
-Offline iPhone web app for tracking stretching (daily checklist) and gym sessions (final-set reps × kg),
+Offline iPhone web app for tracking stretching (stretches grouped into workouts, daily checklist) and gym sessions (final-set reps × kg),
 with a motivational calendar, streaks, progress charts, notes, Calendar-based reminders and JSON backup.
 
 All data is stored on the phone (localStorage). Use **More → Export backup** now and then.
@@ -15,6 +15,7 @@ Host the folder on any HTTPS static host (Netlify Drop, GitHub Pages, Cloudflare
 open the URL in Safari on the iPhone → Share → Add to Home Screen.
 
 ## Rules
-- A stretch day counts when ≥ 50% of that day's stretches are ticked.
+- Each stretch belongs to a workout. A stretch day counts when every stretch in at least one workout is ticked.
+  (Days logged before v2 keep their old 50%-rule result unless edited.)
 - Week (Mon–Sun): **S** green if every day counted, **G** green if ≥ 1 gym session.
 - Days before your first use don't count against you.

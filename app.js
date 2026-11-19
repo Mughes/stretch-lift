@@ -2,7 +2,7 @@
 /* Stretch + Lift — everything is stored on this device (localStorage). */
 
 const KEY = 'stretchlift.v1';
-const STRETCH_TARGET = 0.5; // a day counts once >= 50% of stretches are ticked
+// A stretch day counts once every stretch in at least one workout is ticked.
 
 // ---------- small utils ----------
 const $ = (s, el = document) => el.querySelector(s);
@@ -24,10 +24,11 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
 // ---------- state ----------
 function blankState() {
   return {
-    version: 1,
-    stretches: [],   // {id, name, archived}
+    version: 2,
+    workouts: [],    // {id, name, archived}
+    stretches: [],   // {id, name, archived, workoutId, archivedWith?}
     lifts: [],       // {id, name, archived}
-    stretchLog: {},  // date -> {items:[ids in that session], done:[ids], notes}
+    stretchLog: {},  // date -> {items:[ids], done:[ids], groups:{workoutId:[ids]}, notes} (+ legacyMet for v1 days)
     gymLog: {},      // date -> {entries:{liftId:{reps, kg}}, notes}
     settings: { startDate: todayKey(), stretchTime: '20:00', gymDay: 'FR', gymTime: '18:00', lastBackup: null },
   };
@@ -35,7 +36,26 @@ function blankState() {
 function normalise(s) {
   const b = blankState();
   if (!s || typeof s !== 'object') return b;
-  return { ...b, ...s, settings: { ...b.settings, ...(s.settings || {}) } };
+  const st = { ...b, ...s, settings: { ...b.settings, ...(s.settings || {}) } };
+  migrate(st);
+  return st;
+}
+function migrate(st) {
+  if (!Array.isArray(st.workouts)) st.workouts = [];
+  // v1 → v2: stretches had no workout, so put any orphans into one default workout.
+  const orphans = st.stretches.filter(x => !st.workouts.some(w => w.id === x.workoutId));
+  if (orphans.length) {
+    let w = st.workouts.find(x => !x.archived);
+    if (!w) { w = { id: uid(), name: 'My stretches', archived: false }; st.workouts.push(w); }
+    for (const x of orphans) x.workoutId = w.id;
+  }
+  // Days logged under the old 50% rule keep the result they had (until edited).
+  for (const s of Object.values(st.stretchLog)) {
+    if (s.groups || s.legacyMet !== undefined) continue;
+    const items = s.items || [], done = (s.done || []).filter(id => items.includes(id)).length;
+    s.legacyMet = items.length > 0 && done / items.length >= 0.5;
+  }
+  st.version = 2;
 }
 function load() {
   try { return normalise(JSON.parse(localStorage.getItem(KEY))); } catch (e) { return blankState(); }
@@ -57,11 +77,12 @@ const ui = {
 };
 
 // ---------- exercises ----------
-const listOf = kind => (kind === 'stretch' ? state.stretches : state.lifts);
+const listOf = kind => (kind === 'stretch' ? state.stretches : kind === 'workout' ? state.workouts : state.lifts);
 const activeOf = kind => listOf(kind).filter(x => !x.archived);
 const findEx = (kind, id) => listOf(kind).find(x => x.id === id);
-const noun = kind => (kind === 'stretch' ? 'stretch' : 'exercise');
-const nouns = kind => (kind === 'stretch' ? 'stretches' : 'exercises');
+const noun = kind => ({ stretch: 'stretch', workout: 'workout', lift: 'exercise' }[kind]);
+const nouns = kind => ({ stretch: 'stretches', workout: 'workouts', lift: 'exercises' }[kind]);
+const stretchesIn = wid => activeOf('stretch').filter(x => x.workoutId === wid);
 
 function startKey() {
   let s = state.settings.startDate || todayKey();
@@ -78,14 +99,33 @@ function stretchIdsFor(date) {
   if (s) for (const id of s.done) if (!ids.includes(id) && findEx('stretch', id)) ids.push(id);
   return ids;
 }
+// The workouts shown for a date, each with the stretch ids in it (empty workouts included).
+function groupsFor(date) {
+  const out = activeOf('workout').map(w => ({ w, ids: [] }));
+  for (const id of stretchIdsFor(date)) {
+    const ex = findEx('stretch', id);
+    let g = out.find(o => o.w.id === ex.workoutId);
+    if (!g) { const w = findEx('workout', ex.workoutId); if (!w) continue; g = { w, ids: [] }; out.push(g); }
+    g.ids.push(id);
+  }
+  return out;
+}
+function snapshot(date, s) {
+  s.items = stretchIdsFor(date);
+  s.groups = Object.fromEntries(groupsFor(date).filter(g => g.ids.length).map(g => [g.w.id, g.ids]));
+  delete s.legacyMet;
+}
 function stretchScore(date) {
   const s = state.stretchLog[date];
-  if (!s || !s.items.length) return null;
-  const done = s.done.filter(id => s.items.includes(id)).length;
-  return { done, total: s.items.length, ratio: done / s.items.length };
+  if (!s) return null;
+  const any = s.done.length > 0;
+  if (s.legacyMet !== undefined) return { met: s.legacyMet, any, completed: [] };
+  const done = new Set(s.done);
+  const completed = Object.entries(s.groups || {}).filter(([, ids]) => ids.length && ids.every(id => done.has(id))).map(([wid]) => wid);
+  return { met: completed.length > 0, any, completed };
 }
-function stretchMet(date) { const sc = stretchScore(date); return !!sc && sc.ratio >= STRETCH_TARGET; }
-function stretchSession(date) { return state.stretchLog[date] || (state.stretchLog[date] = { items: [], done: [], notes: '' }); }
+function stretchMet(date) { const sc = stretchScore(date); return !!sc && sc.met; }
+function stretchSession(date) { return state.stretchLog[date] || (state.stretchLog[date] = { items: [], done: [], groups: {}, notes: '' }); }
 function dropIfEmptyStretch(date) {
   const s = state.stretchLog[date];
   if (s && !s.done.length && !s.notes.trim()) delete state.stretchLog[date];
@@ -94,13 +134,13 @@ function toggleStretch(date, id, on) {
   const s = stretchSession(date);
   s.done = s.done.filter(x => x !== id);
   if (on) s.done.push(id);
-  s.items = stretchIdsFor(date); // snapshot the list this day was scored against
+  snapshot(date, s); // record which workouts this day was scored against
   dropIfEmptyStretch(date);
 }
-// Keep today's denominator in step when the stretch list changes.
+// Keep today's scoring in step when workouts or stretches change.
 function resyncToday() {
   const t = todayKey(), s = state.stretchLog[t];
-  if (s) { s.items = stretchIdsFor(t); dropIfEmptyStretch(t); }
+  if (s) { snapshot(t, s); dropIfEmptyStretch(t); }
 }
 
 // ---------- gym ----------
@@ -192,43 +232,100 @@ function editList(kind) {
   </form>
   <div class="card list">
     ${items.length ? items.map((x, i) => `
-    <div class="row edit-row">
-      <span class="row-name">${esc(x.name)}</span>
-      <button class="icon-btn sm" data-action="move" data-kind="${kind}" data-id="${x.id}" data-step="-1" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
-      <button class="icon-btn sm" data-action="move" data-kind="${kind}" data-id="${x.id}" data-step="1" ${i === items.length - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
-      <button class="icon-btn sm" data-action="rename" data-kind="${kind}" data-id="${x.id}" aria-label="Rename">✎</button>
-      <button class="icon-btn sm danger" data-action="archive" data-kind="${kind}" data-id="${x.id}" aria-label="Delete">✕</button>
-    </div>`).join('') : `<p class="empty">No ${nouns(kind)} yet — add your first above.</p>`}
+    <div class="row edit-row"><span class="row-name">${esc(x.name)}</span>${editButtons(kind, x, i, items.length)}</div>`).join('') : `<p class="empty">No ${nouns(kind)} yet — add your first above.</p>`}
   </div>
   <p class="hint">Deleting keeps all past history. Deleted ${nouns(kind)} can be restored from More.</p>
   <button class="btn wide" data-action="edit" data-kind="${kind}">Done</button>`;
 }
 
+function editButtons(kind, x, i, n, extraAction) {
+  return `
+      <button class="icon-btn sm" data-action="move" data-kind="${kind}" data-id="${x.id}" data-step="-1" ${i === 0 ? 'disabled' : ''} aria-label="Move up">↑</button>
+      <button class="icon-btn sm" data-action="move" data-kind="${kind}" data-id="${x.id}" data-step="1" ${i === n - 1 ? 'disabled' : ''} aria-label="Move down">↓</button>
+      <button class="icon-btn sm" data-action="${extraAction || 'rename'}" data-kind="${kind}" data-id="${x.id}" aria-label="Edit">✎</button>
+      <button class="icon-btn sm danger" data-action="archive" data-kind="${kind}" data-id="${x.id}" aria-label="Delete">✕</button>`;
+}
+function editStretches() {
+  const ws = activeOf('workout');
+  let html = `
+  <form class="card add-form" data-add="workout">
+    <input type="text" name="exname" placeholder="New workout (e.g. Morning)" autocomplete="off" autocapitalize="words" enterkeyhint="done" maxlength="60">
+    <button class="btn">Add</button>
+  </form>`;
+  if (!ws.length) html += `<div class="card"><p class="empty">Start by adding a workout above, then add its stretches.</p></div>`;
+  ws.forEach((w, i) => {
+    const items = stretchesIn(w.id);
+    html += `
+  <section class="card group">
+    <div class="row edit-row group-edit-head">
+      <strong class="row-name">${esc(w.name)}</strong>${editButtons('workout', w, i, ws.length)}
+    </div>
+    <div class="list">
+      ${items.map((x, j) => `<div class="row edit-row"><span class="row-name">${esc(x.name)}</span>${editButtons('stretch', x, j, items.length, 'edit-stretch')}</div>`).join('')}
+    </div>
+    <form class="add-form inset" data-add="stretch" data-workout="${w.id}">
+      <input type="text" name="exname" placeholder="Add stretch to ${esc(w.name)}" autocomplete="off" autocapitalize="sentences" enterkeyhint="done" maxlength="60">
+      <button class="btn">Add</button>
+    </form>
+  </section>`;
+  });
+  html += `<p class="hint">A day counts when every stretch in at least one workout is ticked. Tap ✎ on a stretch to rename it or move it to another workout. Deleting keeps all past history; restore from More.</p>
+  <button class="btn wide" data-action="edit" data-kind="stretch">Done</button>`;
+  return html;
+}
+
 // ---------- views ----------
 function viewStretch() {
-  if (ui.edit.stretch) return editList('stretch');
-  const date = ui.date.stretch, ids = stretchIdsFor(date), s = state.stretchLog[date];
+  if (ui.edit.stretch) return editStretches();
+  const date = ui.date.stretch, s = state.stretchLog[date];
+  const groups = groupsFor(date).filter(g => g.ids.length);
   let html = dateNav('stretch');
-  if (!ids.length) return html + emptyCard('stretch') + notesCard('stretch', s ? s.notes : '');
+  if (!groups.length) return html + emptyCard('stretch') + notesCard('stretch', s ? s.notes : '');
   const done = new Set(s ? s.done : []);
-  const n = ids.filter(id => done.has(id)).length, total = ids.length;
-  const need = Math.ceil(total * STRETCH_TARGET);
-  const met = n >= need;
-  html += `
-  <div class="card ${met ? 'met' : ''}">
-    <div class="bar"><span style="width:${(n / total) * 100}%"></span><i></i></div>
-    <div class="progress-text"><strong>${n} of ${total}</strong> done · ${met ? '✓ counts for the day' : `${need - n} more to count for the day`}</div>
-  </div>
-  <div class="card list">
-    ${ids.map(id => {
-      const ex = findEx('stretch', id);
-      return `<label class="row check-row"><input type="checkbox" data-stretch="${id}" ${done.has(id) ? 'checked' : ''}>
-        <span class="row-name">${esc(ex.name)}${ex.archived ? '<em class="tag">removed</em>' : ''}</span></label>`;
-    }).join('')}
-  </div>`;
+  const complete = groups.filter(g => g.ids.every(id => done.has(id)));
+  const legacy = s && s.legacyMet !== undefined;
+  html += complete.length
+    ? `<div class="banner ok">✓ Day complete — ${complete.map(g => esc(g.w.name)).join(', ')} done</div>`
+    : legacy && s.legacyMet
+      ? `<div class="banner ok">✓ Counted under the old 50% rule. Ticking anything now re-scores this day by workout.</div>`
+      : `<div class="banner warn">Finish every stretch in ${groups.length > 1 ? 'any one workout' : 'the workout'} to complete the day</div>`;
+  for (const g of groups) {
+    const n = g.ids.filter(id => done.has(id)).length, all = n === g.ids.length;
+    html += `
+  <section class="card group ${all ? 'met' : ''}">
+    <div class="group-head"><strong>${esc(g.w.name)}${g.w.archived ? '<em class="tag">removed</em>' : ''}</strong><span class="count">${all ? '✓ ' : ''}${n}/${g.ids.length}</span></div>
+    <div class="bar"><span style="width:${(n / g.ids.length) * 100}%"></span></div>
+    <div class="list">
+      ${g.ids.map(id => {
+        const ex = findEx('stretch', id);
+        return `<label class="row check-row"><input type="checkbox" data-stretch="${id}" ${done.has(id) ? 'checked' : ''}>
+          <span class="row-name">${esc(ex.name)}${ex.archived ? '<em class="tag">removed</em>' : ''}</span></label>`;
+      }).join('')}
+    </div>
+  </section>`;
+  }
   html += notesCard('stretch', s ? s.notes : '');
-  html += `<button class="link-btn" data-action="edit" data-kind="stretch">Add or edit stretches</button>`;
+  html += `<button class="link-btn" data-action="edit" data-kind="stretch">Add or edit workouts &amp; stretches</button>`;
   return html;
+}
+function openStretchEditor(id) {
+  const ex = findEx('stretch', id);
+  $('#sheet').innerHTML = `
+  <div class="sheet-backdrop" data-action="close-sheet"></div>
+  <form class="sheet-panel" data-edit-stretch="${id}" role="dialog" aria-label="Edit stretch">
+    <div class="grabber"></div>
+    <h2>Edit stretch</h2>
+    <div class="card">
+      <label class="notes-label" for="es-name">Name</label>
+      <input type="text" id="es-name" name="exname" value="${esc(ex.name)}" maxlength="60" style="width:100%">
+      <label class="notes-label" for="es-w" style="margin-top:12px">Workout</label>
+      <select id="es-w" name="workout" style="width:100%">
+        ${activeOf('workout').map(w => `<option value="${w.id}" ${w.id === ex.workoutId ? 'selected' : ''}>${esc(w.name)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="btn-row"><button type="button" class="btn secondary" data-action="close-sheet">Cancel</button><button class="btn">Save</button></div>
+  </form>`;
+  $('#sheet').hidden = false;
 }
 
 function gymWeekHTML(date) {
@@ -303,8 +400,8 @@ function viewCalendar() {
       if (d.slice(0, 7) !== ui.calMonth) cls += ' out';
       if (d === today) cls += ' today';
       if (d <= today) {
-        if (sc && sc.ratio >= STRETCH_TARGET) cls += ' s-met';
-        else if (sc && sc.done > 0) cls += ' s-part';
+        if (sc && sc.met) cls += ' s-met';
+        else if (sc && sc.any) cls += ' s-part';
         else if (d >= start && d < today) cls += ' s-miss';
       }
       if (gymHas(d)) cls += ' g';
@@ -316,12 +413,12 @@ function viewCalendar() {
   }
   html += `</div>
     <div class="legend">
-      <span><i style="background:var(--green)"></i>Stretched ≥50%</span>
+      <span><i style="background:var(--green)"></i>Workout done</span>
       <span><i style="background:var(--amber-soft);box-shadow:inset 0 0 0 1px var(--amber)"></i>Some</span>
       <span><i style="background:var(--red-soft);box-shadow:inset 0 0 0 1px var(--red)"></i>Missed</span>
       <span><i style="background:var(--gym);width:7px;height:7px"></i>Gym</span>
     </div>
-    <p class="small">Week column: <b>S</b> goes green when you stretch every day, <b>G</b> when you go to the gym at least once (Mon–Sun). Tap a day for details.</p>
+    <p class="small">A stretch day counts when you finish every stretch in at least one workout. Week column: <b>S</b> goes green when you do that every day, <b>G</b> when you go to the gym at least once (Mon–Sun). Tap a day for details.</p>
   </div>`;
   return html;
 }
@@ -402,7 +499,9 @@ const DAYS = [['MO', 'Monday'], ['TU', 'Tuesday'], ['WE', 'Wednesday'], ['TH', '
 function viewMore() {
   const set = state.settings;
   const standalone = window.navigator.standalone || matchMedia('(display-mode: standalone)').matches;
-  const archived = [...state.stretches.map(x => ['stretch', x]), ...state.lifts.map(x => ['lift', x])].filter(([, x]) => x.archived);
+  // Stretches deleted along with their workout come back when the workout is restored.
+  const archived = [...state.workouts.map(x => ['workout', x]), ...state.stretches.map(x => ['stretch', x]), ...state.lifts.map(x => ['lift', x])]
+    .filter(([, x]) => x.archived && !x.archivedWith);
   const nStretch = Object.keys(state.stretchLog).filter(stretchMet).length;
   const nGym = Object.keys(state.gymLog).filter(gymHas).length;
   const backupAge = set.lastBackup ? Math.floor((Date.now() - new Date(set.lastBackup)) / 864e5) : null;
@@ -433,8 +532,8 @@ function viewMore() {
   </div>`;
 
   if (archived.length) {
-    html += `<h2 class="section-title">Deleted exercises</h2><div class="card list">
-      ${archived.map(([kind, x]) => `<div class="row"><span class="row-name">${esc(x.name)} <em class="tag">${kind === 'stretch' ? 'stretch' : 'gym'}</em></span>
+    html += `<h2 class="section-title">Deleted items</h2><div class="card list">
+      ${archived.map(([kind, x]) => `<div class="row"><span class="row-name">${esc(x.name)} <em class="tag">${{ workout: 'stretch workout', stretch: 'stretch', lift: 'gym' }[kind]}</em></span>
         <button class="link-btn" style="margin:0" data-action="restore" data-kind="${kind}" data-id="${x.id}">Restore</button></div>`).join('')}
     </div>`;
   }
@@ -453,8 +552,10 @@ function openDay(d) {
     <div class="grabber"></div>
     <h2>${fmtDay(d, { weekday: 'long', day: 'numeric', month: 'long' })}</h2>
     <div class="card">
-      <b>Stretching</b> ${sc ? `· ${sc.done}/${sc.total} ${sc.ratio >= STRETCH_TARGET ? '✓' : ''}` : ''}
-      <p class="small">${doneNames.length ? doneNames.join(', ') : 'Nothing logged'}</p>
+      <b>Stretching</b> ${sc ? (sc.met ? '· ✓ complete' : '· not complete') : ''}
+      ${sc && sc.completed.length ? `<p class="small">Finished: ${sc.completed.map(id => findEx('workout', id)).filter(Boolean).map(w => esc(w.name)).join(', ')}</p>` : ''}
+      ${s && s.legacyMet !== undefined ? '<p class="small">Scored under the old 50% rule</p>' : ''}
+      <p class="small">${doneNames.length ? `Ticked: ${doneNames.join(', ')}` : 'Nothing logged'}</p>
       ${s && s.notes ? `<p class="small">📝 ${esc(s.notes)}</p>` : ''}
     </div>
     <div class="card">
@@ -529,7 +630,7 @@ function render() {
     b.classList.toggle('active', on);
     if (on) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current');
   });
-  const title = ui.tab === 'stretch' && ui.edit.stretch ? 'Edit stretches' : ui.tab === 'gym' && ui.edit.lift ? 'Edit exercises' : TITLES[ui.tab];
+  const title = ui.tab === 'stretch' && ui.edit.stretch ? 'Edit workouts' : ui.tab === 'gym' && ui.edit.lift ? 'Edit exercises' : TITLES[ui.tab];
   $('#title').textContent = title;
   $('#view').innerHTML = VIEWS[ui.tab]();
 }
@@ -557,8 +658,9 @@ document.addEventListener('click', e => {
     case 'date-today': ui.date[kind] = todayKey(); render(); break;
     case 'edit': ui.edit[kind] = !ui.edit[kind]; render(); window.scrollTo(0, 0); break;
     case 'move': {
-      const list = listOf(kind), active = activeOf(kind);
-      const i = active.findIndex(x => x.id === id), other = active[i + step];
+      const list = listOf(kind), me = findEx(kind, id);
+      const active = kind === 'stretch' ? stretchesIn(me.workoutId) : activeOf(kind); // stretches reorder within their workout
+      const i = active.indexOf(me), other = active[i + step];
       if (!other) break;
       const a = list.indexOf(active[i]), b = list.indexOf(other);
       [list[a], list[b]] = [list[b], list[a]];
@@ -570,16 +672,30 @@ document.addEventListener('click', e => {
       if (name && name.trim()) { ex.name = name.trim().slice(0, 60); save(); render(); }
       break;
     }
+    case 'edit-stretch': openStretchEditor(id); break;
     case 'archive': {
       const ex = findEx(kind, id);
-      if (!confirm(`Delete “${ex.name}”? Past sessions keep it in your history.`)) break;
+      if (kind === 'workout') {
+        const inside = stretchesIn(id);
+        if (!confirm(`Delete workout “${ex.name}”${inside.length ? ` and its ${inside.length} stretch${inside.length === 1 ? '' : 'es'}` : ''}? Past sessions keep them in your history.`)) break;
+        for (const x of inside) { x.archived = true; x.archivedWith = id; }
+      } else if (!confirm(`Delete “${ex.name}”? Past sessions keep it in your history.`)) break;
       ex.archived = true;
-      if (kind === 'stretch') resyncToday();
+      if (kind !== 'lift') resyncToday();
       save(); render(); toast(`Deleted ${ex.name}`); break;
     }
     case 'restore': {
       const ex = findEx(kind, id); ex.archived = false;
-      if (kind === 'stretch') resyncToday();
+      if (kind === 'workout') {
+        for (const x of state.stretches) if (x.archivedWith === id) { x.archived = false; delete x.archivedWith; }
+      } else if (kind === 'stretch') {
+        const w = findEx('workout', ex.workoutId);
+        if (w && w.archived) { // bring its workout back too, with whatever was deleted alongside it
+          w.archived = false;
+          for (const x of state.stretches) if (x.archivedWith === w.id) { x.archived = false; delete x.archivedWith; }
+        }
+      }
+      if (kind !== 'lift') resyncToday();
       save(); render(); toast(`Restored ${ex.name}`); break;
     }
     case 'cal': {
@@ -624,7 +740,7 @@ document.addEventListener('input', e => {
     if (kind === 'stretch') {
       const s = stretchSession(date);
       s.notes = t.value;
-      if (!s.items.length) s.items = stretchIdsFor(date);
+      if (!s.groups && s.legacyMet === undefined) snapshot(date, s);
       dropIfEmptyStretch(date);
     } else {
       gymSession(date).notes = t.value; dropIfEmptyGym(date);
@@ -634,16 +750,32 @@ document.addEventListener('input', e => {
 });
 
 document.addEventListener('submit', e => {
+  const ed = e.target.closest('[data-edit-stretch]');
+  if (ed) {
+    e.preventDefault();
+    const ex = findEx('stretch', ed.dataset.editStretch), name = ed.elements.exname.value.trim().slice(0, 60), wid = ed.elements.workout.value;
+    if (name) ex.name = name;
+    if (wid && wid !== ex.workoutId) { // move to the bottom of the new workout
+      ex.workoutId = wid;
+      state.stretches.splice(state.stretches.indexOf(ex), 1); state.stretches.push(ex);
+    }
+    resyncToday(); save(); closeSheet(); render(); return;
+  }
   const f = e.target.closest('[data-add]');
   if (!f) return;
   e.preventDefault();
-  const kind = f.dataset.add, input = f.elements.exname, name = input.value.trim().slice(0, 60);
+  const kind = f.dataset.add, wid = f.dataset.workout, name = f.elements.exname.value.trim().slice(0, 60);
   if (!name) return;
-  if (activeOf(kind).some(x => x.name.toLowerCase() === name.toLowerCase())) { toast(`“${name}” is already on the list`); return; }
-  listOf(kind).push({ id: uid(), name, archived: false });
-  if (kind === 'stretch') resyncToday();
+  const siblings = kind === 'stretch' ? stretchesIn(wid) : activeOf(kind);
+  if (siblings.some(x => x.name.toLowerCase() === name.toLowerCase())) { toast(`“${name}” is already on the list`); return; }
+  const item = { id: uid(), name, archived: false };
+  if (kind === 'stretch') item.workoutId = wid;
+  listOf(kind).push(item);
+  if (kind !== 'lift') resyncToday();
   save(); render();
-  const again = $('[data-add] input'); if (again) again.focus(); // keep adding without re-tapping
+  // keep adding without re-tapping (for a new workout, jump to its stretch box)
+  const again = kind === 'workout' ? $(`[data-workout="${item.id}"] input`) : $(`[data-add="${kind}"]${wid ? `[data-workout="${wid}"]` : ''} input`);
+  if (again) again.focus();
 });
 
 // Roll "today" over if the app is left open past midnight.
@@ -661,5 +793,11 @@ document.addEventListener('visibilitychange', () => {
 // ---------- boot ----------
 if (VIEWS[location.hash.slice(1)]) ui.tab = location.hash.slice(1); // e.g. …/#calendar
 render();
-if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) {
+  // When an updated version installs, reload once so it's used straight away.
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});

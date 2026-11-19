@@ -1,10 +1,11 @@
 // Offline support: serve the app from cache, refresh the cache in the background.
 // Bump VERSION whenever the app files change so phones pick up the update.
-const VERSION = 'stretch-lift-v1';
+const VERSION = 'stretch-lift-v2';
 const ASSETS = ['./', './index.html', './app.js', './styles.css', './manifest.webmanifest', './icon-192.png', './icon-512.png', './apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(ASSETS)).then(() => self.skipWaiting()));
+  // cache: 'reload' bypasses the HTTP cache so an update really fetches the new files
+  e.waitUntil(caches.open(VERSION).then(c => c.addAll(ASSETS.map(u => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener('activate', e => {
